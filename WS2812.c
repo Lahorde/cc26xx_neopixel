@@ -29,6 +29,7 @@
 #include <ti/sysbios/family/arm/cc26xx/Power.h>
 #include <ti/sysbios/family/arm/m3/Hwi.h>
 #include <ti/sysbios/BIOS.h>
+#include <ti/sysbios/knl/Semaphore.h>
 
 #include <driverlib/ioc.h>
 #include <driverlib/timer.h>
@@ -40,8 +41,10 @@
 /**************************************************************************
  * Manifest Constants
  **************************************************************************/
+
+//TODO : ADD limitation on NB_PIXELS
 #ifndef NB_PIXELS
-#define NB_PIXELS 3U
+#define NB_PIXELS 1U
 #endif
 
 // 800kHz freq
@@ -71,8 +74,7 @@ static uint8_t _pixels[NB_PIXELS][NB_COlORS] = {0};
 static uint32_t _pixelsDMA[NB_PIXELS*NB_COlORS*8 + 42] = {0};
 static Hwi_Struct _hwi;
 static UDMACC26XX_Handle      _udmaHandle;
-static volatile bool _transferComplete = false;
-
+static Semaphore_Struct _transferSem;
 /**************************************************************************
  * Macros
  **************************************************************************/
@@ -117,21 +119,23 @@ void WS2812_show(void)
 	WS2812_timerInit();
 	WS2812_fillDMAPixels();
 
-	_transferComplete = false;
+    // Semaphore to check transfer from application task
+	Semaphore_Params loc_semParams;
+    Semaphore_Params_init(&loc_semParams);
+    loc_semParams.mode = Semaphore_Mode_BINARY;
+    Semaphore_construct(&_transferSem, 0, &loc_semParams);
 
 	// GOOOOOOOO!!!!!!!!
 	TimerEnable(GPT0_BASE, TIMER_A);
 
-	if(!_transferComplete)
+	if(Semaphore_pend(Semaphore_handle(&_transferSem), BIOS_NO_WAIT))
 	{
-		while(!_transferComplete){
-
-		}
 		WS2812_timerDeinit();
 		WS2812_udmaDeinit();
 
 		Power_releaseConstraint(Power_SB_DISALLOW);
 	}
+	Semaphore_destruct(&_transferSem);
 }
 
 void WS2812_setPin(uint8_t p)
@@ -182,8 +186,6 @@ void WS2812_timerInit(void)
 	TimerIntDisable(GPT0_BASE, TIMER_CAPA_MATCH);
 	TimerIntDisable(GPT0_BASE, TIMER_TIMA_TIMEOUT);
 
-	// Periodic timer
-	//TimerConfigure(GPT0_BASE, TIMER_CFG_SPLIT_PAIR | TIMER_CFG_PERIODIC);
 	//PWM timer
 	TimerConfigure(GPT0_BASE, TIMER_CFG_SPLIT_PAIR | TIMER_CFG_A_PWM);
 
@@ -203,8 +205,7 @@ void WS2812_timerInit(void)
 
 void WS2812_timerDeinit(void)
 {
-	// be sure timer disabled before making any changes
-	TimerDisable(GPT0_BASE, TIMER_A);
+	// Timer has already been disabled in ISR
 
 	// clear all timer ITs
 	TimerIntClear(GPT0_BASE, TIMER_TIMA_DMA);
@@ -276,9 +277,7 @@ void WS2812_udmaDeinit(void)
 	// !! mask and not channel must be given as parameter
 	UDMACC26XX_clearInterrupt(_udmaHandle, 1 << UDMA_CHAN_TIMER0_A);
 
-	//Disable the DMA chanel
-	// !! mask and not channel must be given as parameter
-	UDMACC26XX_channelDisable(_udmaHandle, 1 << UDMA_CHAN_TIMER0_A);
+	//Channel has already been disabled in ISR
 
 	UDMACC26XX_close(_udmaHandle);
 }
@@ -335,11 +334,11 @@ void WS2812_hwTimerAIT(UArg arg)
 
 		//At the end of a complete μDMA transfer, the controller automatically disables the channel.
 
-		_transferComplete = true;
-
 		//disable UDMA and timer - full peripheral release done in application task
 		UDMACC26XX_channelDisable(_udmaHandle, 1 << UDMA_CHAN_TIMER0_A);
 		TimerDisable(GPT0_BASE, TIMER_A);
+
+		Semaphore_post(Semaphore_handle(&_transferSem));
 	}
 	else
 	{
