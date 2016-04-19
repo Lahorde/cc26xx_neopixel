@@ -71,6 +71,7 @@ static uint8_t _pixels[NB_PIXELS][NB_COlORS] = {0};
 static uint32_t _pixelsDMA[NB_PIXELS*NB_COlORS*8 + 42] = {0};
 static Hwi_Struct _hwi;
 static UDMACC26XX_Handle      _udmaHandle;
+static volatile bool _transferComplete = false;
 
 /**************************************************************************
  * Macros
@@ -116,8 +117,21 @@ void WS2812_show(void)
 	WS2812_timerInit();
 	WS2812_fillDMAPixels();
 
+	_transferComplete = false;
+
 	// GOOOOOOOO!!!!!!!!
 	TimerEnable(GPT0_BASE, TIMER_A);
+
+	if(!_transferComplete)
+	{
+		while(!_transferComplete){
+
+		}
+		WS2812_timerDeinit();
+		WS2812_udmaDeinit();
+
+		Power_releaseConstraint(Power_SB_DISALLOW);
+	}
 }
 
 void WS2812_setPin(uint8_t p)
@@ -182,9 +196,6 @@ void WS2812_timerInit(void)
 
 	// enable DMA IT
 	TimerIntEnable(GPT0_BASE, TIMER_TIMA_DMA);
-	// Enable capture event - if not enabled some DMA transfer are done and
-	// then IT not called whereas Capture Event IT set
-	TimerIntEnable(GPT0_BASE, TIMER_CAPA_EVENT);
 
 	// Enable DMA Trigger Enable
 	HWREG(GPT0_BASE + GPT_O_DMAEV) |= GPT_DMAEV_CAEDMAEN;
@@ -215,9 +226,7 @@ void WS2812_timerDeinit(void)
 	// Disable DMA Trigger Enable
 	HWREG(GPT0_BASE + GPT_O_DMAEV) &= ~GPT_DMAEV_CAEDMAEN;
 
-	//Power_releaseDependency(PERIPH_GPT0);
-
-	TimerDisable(GPT0_BASE, TIMER_A);
+	Power_releaseDependency(PERIPH_GPT0);
 }
 
 /**
@@ -316,10 +325,6 @@ void WS2812_fillDMAPixels(void){
 
 void WS2812_hwTimerAIT(UArg arg)
 {
-	// Clear Timer a event (rising edge)
-	if(TimerIntStatus(GPT0_BASE, true) & TIMER_CAPA_EVENT)
-		TimerIntClear(GPT0_BASE, TIMER_CAPA_EVENT);
-
 	// DMA transfer done
 	if (UDMACC26XX_channelDone(_udmaHandle, 1 << UDMA_CHAN_TIMER0_A)) {
 
@@ -330,11 +335,11 @@ void WS2812_hwTimerAIT(UArg arg)
 
 		//At the end of a complete μDMA transfer, the controller automatically disables the channel.
 
-		WS2812_timerDeinit();
-		WS2812_udmaDeinit();
+		_transferComplete = true;
 
-		// Enable switching to standby mode as it switch off timer
-		//Power_releaseConstraint(Power_SB_DISALLOW);
+		//disable UDMA and timer - full peripheral release done in application task
+		UDMACC26XX_channelDisable(_udmaHandle, 1 << UDMA_CHAN_TIMER0_A);
+		TimerDisable(GPT0_BASE, TIMER_A);
 	}
 	else
 	{
