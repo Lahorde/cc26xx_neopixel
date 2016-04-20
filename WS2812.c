@@ -30,6 +30,7 @@
 #include <ti/sysbios/family/arm/m3/Hwi.h>
 #include <ti/sysbios/BIOS.h>
 #include <ti/sysbios/knl/Semaphore.h>
+#include <ti/sysbios/knl/Clock.h>
 
 #include <driverlib/ioc.h>
 #include <driverlib/timer.h>
@@ -128,12 +129,17 @@ void WS2812_show(void)
 	// GOOOOOOOO!!!!!!!!
 	TimerEnable(GPT0_BASE, TIMER_A);
 
-	if(Semaphore_pend(Semaphore_handle(&_transferSem), BIOS_NO_WAIT))
+	//Wait 100 ms
+	if(Semaphore_pend(Semaphore_handle(&_transferSem), 100000/Clock_tickPeriod))
 	{
 		WS2812_timerDeinit();
 		WS2812_udmaDeinit();
 
 		Power_releaseConstraint(Power_SB_DISALLOW);
+	}
+	else
+	{
+		ASSERT(FALSE);
 	}
 	Semaphore_destruct(&_transferSem);
 }
