@@ -4,7 +4,28 @@
  * @date    10/04/2016
  *
  * @brief WS2812 driver implementation on Texas Instruments CC26xx.
- * UDMA peripheral used to control WS2812.
+ * First implementation using UDMA + GPT configured as PWM was used
+ * but timing was not precise / UDMA too long :
+ *   * https://e2e.ti.com/support/wireless_connectivity/bluetooth_low_energy/f/538/t/541648
+ *   * https://e2e.ti.com/support/wireless_connectivity/bluetooth_low_energy/f/538/t/542169
+ *
+ * So this implementation uses SPI configured at 3 x Neopixel Freq = 2.4MHz.
+ * In this case a bit duration = 1/2.4MHz = 416ns. As 3 bits can be transferred in 1/NeopixelFreq
+ * we can get a precise signal with :
+ *   * 1 bit to 1 during 416ns and 2 other bits to 0. In this case a 1 bit is transferred to WS2812. We follow datasheet reqs
+ *  350ns - 150ns < T0H = 416ns < 350ns + 150ns
+ *  800ns - 150ns < T0L = 1250ns - T0H = 834 ns < 800ns + 150ns
+ *
+ *   * 2 bits to 1 during 833ns and 1 other bit to 0. In this case a 1 bit is transferred to WS2812. We do not follow datasheet reqs for T1L but
+ *   after testing it works
+ *  700ns - 150ns < T1H = 833ns < 700ns + 150ns
+ *  600ns - 150ns < T1L = 1250ns - T1H = 417 ns < 600ns + 150ns
+ *
+ * 24 bit (GRB) color must be send for each neopixel => a buffer of 3x24bit = 72 bits = 9 bytes must be send to SPI for each neopixel.
+ *
+ * SPI SPH must be set in order to have back to back transfers like single word transfer.
+ *
+ * In Board.c you can assign only 1 pin to SPI MOSI (Neopixel data) and let other unsassigned.
  *
  * Project : WS2812_driver
  * Contact:  Rémi Pincent - remi.pincent@inria.fr
@@ -26,18 +47,7 @@
  **************************************************************************/
 #include "WS2812.h"
 
-#include <ti/sysbios/family/arm/cc26xx/Power.h>
-#include <ti/sysbios/family/arm/m3/Hwi.h>
-#include <ti/sysbios/BIOS.h>
-#include <ti/sysbios/knl/Semaphore.h>
-#include <ti/sysbios/knl/Clock.h>
-
-#include <driverlib/ioc.h>
-#include <driverlib/timer.h>
-
-#include <ti/drivers/dma/UDMACC26XX.h>
-
-#include <xdc/runtime/Types.h>
+#include <ti/drivers/spi/SPICC26XXDMA.h>
 
 /**************************************************************************
  * Manifest Constants
@@ -48,18 +58,13 @@
 #define NB_PIXELS 1U
 #endif
 
-// 800kHz freq
-#define NEOPIXEL_FREQ 800000U
+#define NB_SPI_BYTES_PER_PIXEL 9U
 
-//1 bit low level duration
-#define NEOPIXEL_ZERO_L_NS 800U
-
-//0 bit low level duration
-#define NEOPIXEL_ZERO_H_NS 600U
-
-#define NB_COlORS 3U
-
-#define TIMER_0_A_PWM_MATCH_ADD (GPT0_BASE + GPT_O_TAMATCHR )
+/** Get SPI value corresponding to a bit at index n in a grb color on 24 bits
+ *  1 bit is 0b110
+ *  0 bit is 0b100
+ */
+#define GRB_BIT_TO_SPI_BITS(val, bitPos) ((1 << bitPos & val) ? 0x06 : 0x04)
 
 /**************************************************************************
  * Type Definitions
@@ -68,14 +73,11 @@
 /**************************************************************************
  * Variables
  **************************************************************************/
-static uint8_t _pixels[NB_PIXELS][NB_COlORS] = {0};
-//42 x Bit Duration = T reset > 50µs between two transfer
-//TODO : array members on 8 bits - DMA transfer from 8 bit
-// type to 32 bit type
-static uint32_t _pixelsDMA[NB_PIXELS*NB_COlORS*8 + 42] = {0};
-static Hwi_Struct _hwi;
-static UDMACC26XX_Handle      _udmaHandle;
-static Semaphore_Struct _transferSem;
+/** buffer written to SPI */
+static uint8_t _au8_spiLedBuffer[NB_SPI_BYTES_PER_PIXEL*NB_PIXELS] = {0};
+static SPI_Handle      _spiHandle;
+
+
 /**************************************************************************
  * Macros
  **************************************************************************/
@@ -83,65 +85,50 @@ static Semaphore_Struct _transferSem;
 /**************************************************************************
  * Local Functions Declarations
  **************************************************************************/
-static void WS2812_gpioInit(uint8_t arg_u8_pin);
-static void WS2812_timerInit(void);
-static void WS2812_timerDeinit(void);
-static void WS2812_udmaInit(void);
-static void WS2812_udmaDeinit(void);
-static void WS2812_fillDMAPixels(void);
-static void WS2812_hwTimerAIT(UArg arg);
+
 /**************************************************************************
  * Global Functions Defintions
  **************************************************************************/
-
-/**************************************************************************
- * Local Functions Definitions
- **************************************************************************/
-
-void WS2812_begin(uint8_t arg_u8_pin)
+void WS2812_begin(void)
 {
-	WS2812_gpioInit(arg_u8_pin);
-
-	//Register hw IT
-	//TODO register it in timer init and destroy it after transfer
-	Hwi_Params hwiParams;
-	Hwi_Params_init(&hwiParams);
-	hwiParams.enableInt = true;
-	hwiParams.priority  = 0;
-	//construct an HWI
-	Hwi_construct(&_hwi, INT_TIMER0A, WS2812_hwTimerAIT, &hwiParams, NULL);
+	WS2812_beginSPI(0);
 }
-void WS2812_show(void)
+
+void WS2812_beginSPI(uint8_t arg_u8_spiId)
 {
-	// Disable switching to standby mode as it switch off timer
-	Power_setConstraint(Power_SB_DISALLOW);
+	SPI_Params loc_spiParams;
+	uint16_t loc_u16_pixelIndex;
 
-	WS2812_udmaInit();
-	WS2812_timerInit();
-	WS2812_fillDMAPixels();
+	SPI_Params_init(&loc_spiParams);
+	loc_spiParams.bitRate = 2400000;
+	loc_spiParams.dataSize = 8;
+	loc_spiParams.frameFormat = SPI_POL0_PHA1;
+	_spiHandle = SPI_open(arg_u8_spiId, &loc_spiParams);
 
-    // Semaphore to check transfer from application task
-	Semaphore_Params loc_semParams;
-    Semaphore_Params_init(&loc_semParams);
-    loc_semParams.mode = Semaphore_Mode_BINARY;
-    Semaphore_construct(&_transferSem, 0, &loc_semParams);
 
-	// GOOOOOOOO!!!!!!!!
-	TimerEnable(GPT0_BASE, TIMER_A);
-
-	//Wait 100 ms
-	if(Semaphore_pend(Semaphore_handle(&_transferSem), 100000/Clock_tickPeriod))
+	/** Put all led to 0 */
+	for(loc_u16_pixelIndex = 0; loc_u16_pixelIndex < NB_PIXELS; loc_u16_pixelIndex++)
 	{
-		WS2812_timerDeinit();
-		WS2812_udmaDeinit();
+		WS2812_setPixelColor(loc_u16_pixelIndex, 0, 0, 0);
+	}
+	WS2812_show();
+}
 
-		Power_releaseConstraint(Power_SB_DISALLOW);
-	}
-	else
-	{
-		ASSERT(FALSE);
-	}
-	Semaphore_destruct(&_transferSem);
+void WS2812_close(void)
+{
+	SPI_close(_spiHandle);
+}
+
+bool WS2812_show(void)
+{
+	/** Make SPI transfer */
+	SPI_Transaction spiTransaction;
+
+	spiTransaction.count = sizeof(_au8_spiLedBuffer);
+	spiTransaction.txBuf = _au8_spiLedBuffer;
+	spiTransaction.rxBuf = NULL;
+
+	return SPI_transfer(_spiHandle, &spiTransaction);
 }
 
 void WS2812_setPin(uint8_t p)
@@ -149,205 +136,40 @@ void WS2812_setPin(uint8_t p)
 
 }
 
-void WS2812_setPixelColor(uint16_t n, uint8_t r, uint8_t g, uint8_t b)
-{
-	_pixels[n][0] = g;
-	_pixels[n][1] = r;
-	_pixels[n][2] = b;
-}
-
 /**
- * Initialize WS2812 data output pin
+ * Slow function but few memory consumer, quicker implementation could be done mapping some grb bits to predefined
+ * SPI data
  */
-void WS2812_gpioInit(uint8_t arg_u8_pin)
+void WS2812_setPixelColor(uint16_t arg_u16_ledIndex, uint8_t arg_u8_red, uint8_t arg_u8_green, uint8_t arg_u8_blue)
 {
-	// Configure pin as PWM output (PIn <-> IOC_PORT_MCU_PORT_EVENT0 corresponding to GPT0)
-	IOCPortConfigureSet(arg_u8_pin, IOC_PORT_MCU_PORT_EVENT0, IOC_STD_OUTPUT);
-}
+	uint8_t loc_u8_currIndex = 3;
 
-/**
- * Initialize PWM timer
- */
-void WS2812_timerInit(void)
-{
-	Types_FreqHz loc_cpuFreq;
-	BIOS_getCpuFreq(&loc_cpuFreq);
+	/** Position of current led data in SPI buffer */
+	uint16_t loc_u16_ledOffset = arg_u16_ledIndex*9;
 
-	// GPT not enabled by default Turn on PERIPH power domain and clock for GPT0
-	Power_setDependency(PERIPH_GPT0);
+	/** Concatenate color on a 32bit word */
+	uint32_t loc_u32_grb = arg_u8_green << 16 | arg_u8_red << 8 | arg_u8_blue;
 
-	// be sure timer disabled before making any changes
-	TimerDisable(GPT0_BASE, TIMER_A);
+	/** Concatenate two bytes of SPI buffer in order to always transfer blocks of 3 bits
+	 * to SPI buffer corresponding to a single grb bit*/
+	uint16_t loc_u16_currVal = 0;
 
-	// clear all timer ITs
-	TimerIntClear(GPT0_BASE, TIMER_TIMA_DMA);
-	TimerIntClear(GPT0_BASE, TIMER_TIMA_MATCH);
-	TimerIntClear(GPT0_BASE, TIMER_CAPA_EVENT);
-	TimerIntClear(GPT0_BASE, TIMER_CAPA_MATCH);
-	TimerIntClear(GPT0_BASE, TIMER_TIMA_TIMEOUT);
+	int8_t loc_u8_bitIndex;
 
-	// disable all unneeded IT
-	TimerIntDisable(GPT0_BASE, TIMER_TIMA_MATCH);
-	TimerIntDisable(GPT0_BASE, TIMER_CAPA_EVENT);
-	TimerIntDisable(GPT0_BASE, TIMER_CAPA_MATCH);
-	TimerIntDisable(GPT0_BASE, TIMER_TIMA_TIMEOUT);
-
-	//PWM timer
-	TimerConfigure(GPT0_BASE, TIMER_CFG_SPLIT_PAIR | TIMER_CFG_A_PWM);
-
-	// set the load value of timer-A
-	TimerLoadSet(GPT0_BASE, TIMER_A, loc_cpuFreq.lo/NEOPIXEL_FREQ);
-	//TimerMatchSet(GPT0_BASE, TIMER_A, test);
-
-	//Enable IT on rising edge
-	TimerEventControl(GPT0_BASE, TIMER_A, GPT_CTL_TAEVENT_POS);
-
-	// enable DMA IT
-	TimerIntEnable(GPT0_BASE, TIMER_TIMA_DMA);
-
-	// Enable DMA Trigger Enable
-	HWREG(GPT0_BASE + GPT_O_DMAEV) |= GPT_DMAEV_CAEDMAEN;
-}
-
-void WS2812_timerDeinit(void)
-{
-	// Timer has already been disabled in ISR
-
-	// clear all timer ITs
-	TimerIntClear(GPT0_BASE, TIMER_TIMA_DMA);
-	TimerIntClear(GPT0_BASE, TIMER_TIMA_MATCH);
-	TimerIntClear(GPT0_BASE, TIMER_CAPA_EVENT);
-	TimerIntClear(GPT0_BASE, TIMER_CAPA_MATCH);
-	TimerIntClear(GPT0_BASE, TIMER_TIMA_TIMEOUT);
-
-	// disable all unneeded IT
-	TimerIntDisable(GPT0_BASE, TIMER_TIMA_DMA);
-	TimerIntDisable(GPT0_BASE, TIMER_TIMA_MATCH);
-	TimerIntDisable(GPT0_BASE, TIMER_CAPA_EVENT);
-	TimerIntDisable(GPT0_BASE, TIMER_CAPA_MATCH);
-	TimerIntDisable(GPT0_BASE, TIMER_TIMA_TIMEOUT);
-
-	// destruct HWI
-	//Hwi_destruct(&_hwi);
-
-	// Disable DMA Trigger Enable
-	HWREG(GPT0_BASE + GPT_O_DMAEV) &= ~GPT_DMAEV_CAEDMAEN;
-
-	Power_releaseDependency(PERIPH_GPT0);
-}
-
-/**
- * Initialize DMA transfer
- */
-void WS2812_udmaInit(void)
-{
-	// UDMACC26XX should only be used by SPI driver. Use it anyway as it configures power domain and control table
-	_udmaHandle = UDMACC26XX_open();
-
-	// Event fabric must be configured to route TIMER0_A events to UDMA channel 9 single request trigger
-	// pas besoin de la fabrique???
-	//EventRegister(EVENT_UDMA_PROG0, EVENT_TIMER0_A );
-
-	//Be sure these attributes are disabled
-	uDMAChannelAttributeDisable(UDMA0_BASE,
-			UDMA_CHAN_TIMER0_A,
-			UDMA_ATTR_ALTSELECT | UDMA_ATTR_USEBURST |
-			UDMA_ATTR_HIGH_PRIORITY |
-			UDMA_ATTR_REQMASK);
-
-	//32 bit transfer - no incrementation on source and destination
-	uDMAChannelControlSet(UDMA0_BASE,
-			UDMA_CHAN_TIMER0_A | UDMA_PRI_SELECT,
-			UDMA_SIZE_32 | UDMA_SRC_INC_32 | UDMA_DST_INC_NONE |
-			UDMA_ARB_1);
-
-	// give data to transfer
-	uDMAChannelTransferSet(UDMA0_BASE,
-			UDMA_CHAN_TIMER0_A | UDMA_PRI_SELECT,
-			UDMA_MODE_BASIC,
-			(void*)_pixelsDMA, (void*) TIMER_0_A_PWM_MATCH_ADD,
-			sizeof(_pixelsDMA)/sizeof(_pixelsDMA[0]));
-
-	// Clear DMA done flag
-	// !! mask and not channel must be given as parameter
-	UDMACC26XX_clearInterrupt(_udmaHandle, 1 << UDMA_CHAN_TIMER0_A);
-
-	//Enable the DMA chanel
-	// !! mask and not channel must be given as parameter
-	UDMACC26XX_channelEnable(_udmaHandle, 1 << UDMA_CHAN_TIMER0_A);
-}
-
-void WS2812_udmaDeinit(void)
-{
-	// Clear DMA done flag
-	// !! mask and not channel must be given as parameter
-	UDMACC26XX_clearInterrupt(_udmaHandle, 1 << UDMA_CHAN_TIMER0_A);
-
-	//Channel has already been disabled in ISR
-
-	UDMACC26XX_close(_udmaHandle);
-}
-
-void WS2812_fillDMAPixels(void){
-	uint8_t loc_u8_pixelIndex = 0;
-	uint32_t loc_u32_bitIndex = 0;
-	uint32_t loc_u32_tabIndex = 0;
-	uint32_t loc_u8_colorIndex = 0;
-	Types_FreqHz loc_cpuFreq;
-	BIOS_getCpuFreq(&loc_cpuFreq);
-
-	// TODO - could be defined in a preprocessor directive - check if some CPU FREQ define exist
-	const uint32_t ZERO_LOW_NB_CYCLES = ((loc_cpuFreq.lo/1000000)*NEOPIXEL_ZERO_L_NS)/1000;
-	const uint32_t ZERO_HIGH_NB_CYCLES = ((loc_cpuFreq.lo/1000000)*NEOPIXEL_ZERO_H_NS)/1000;
-	// TODO -1 needed?
-	const uint32_t RESET_NB_CYCLES = HWREG(GPT0_BASE + GPT_O_TAILR) - 1;
-
-	// Fill PWM match value for each period corresponding to a 1/0 bit
-	for(loc_u8_pixelIndex = 0; loc_u8_pixelIndex < NB_PIXELS; loc_u8_pixelIndex++)
+	for(loc_u8_bitIndex = 23; loc_u8_bitIndex >= 0; loc_u8_bitIndex--)
 	{
-		for(loc_u8_colorIndex = 0; loc_u8_colorIndex < NB_COlORS; loc_u8_colorIndex++)
+		loc_u16_currVal |= GRB_BIT_TO_SPI_BITS(loc_u32_grb, loc_u8_bitIndex) << (16 + 8*((loc_u8_currIndex - 3)/8) - loc_u8_currIndex);
+
+		if((loc_u8_currIndex)/8 > (loc_u8_currIndex-3)/8) /** some bits have been written to byte at index 1 in  loc_u16_currVal*/
 		{
-			for(loc_u32_bitIndex = 0; loc_u32_bitIndex < 8; loc_u32_bitIndex++)
-			{
-				if((1 << loc_u32_bitIndex) &  _pixels[loc_u8_pixelIndex][loc_u8_colorIndex])
-				{
-					_pixelsDMA[loc_u32_tabIndex++] = ZERO_HIGH_NB_CYCLES;
-				}
-				else
-				{
-					_pixelsDMA[loc_u32_tabIndex++] = ZERO_LOW_NB_CYCLES;
-				}
-			}
+			/** it's time to shift buffers */
+			_au8_spiLedBuffer[loc_u16_ledOffset + loc_u8_currIndex /8 - 1] = loc_u16_currVal >> 8;
+			loc_u16_currVal = loc_u16_currVal << 8;
 		}
-	}
-
-	//Reset signal on all other periods
-	while(loc_u32_tabIndex < sizeof(_pixelsDMA) / sizeof(_pixelsDMA[0]))
-	{
-		_pixelsDMA[loc_u32_tabIndex++] = RESET_NB_CYCLES;
+		loc_u8_currIndex += 3;
 	}
 }
 
-void WS2812_hwTimerAIT(UArg arg)
-{
-	// DMA transfer done
-	if (UDMACC26XX_channelDone(_udmaHandle, 1 << UDMA_CHAN_TIMER0_A)) {
-
-		//clear DMA req done flag
-		HWREG(UDMA0_BASE+UDMA_O_REQDONE) |= 0x00000200; //clear DMA req done flag
-
-		TimerIntClear(GPT0_BASE, TIMER_TIMA_DMA);
-
-		//At the end of a complete μDMA transfer, the controller automatically disables the channel.
-
-		//disable UDMA and timer - full peripheral release done in application task
-		UDMACC26XX_channelDisable(_udmaHandle, 1 << UDMA_CHAN_TIMER0_A);
-		TimerDisable(GPT0_BASE, TIMER_A);
-
-		Semaphore_post(Semaphore_handle(&_transferSem));
-	}
-	else
-	{
-		ASSERT(false);
-	}
-}
+/**************************************************************************
+ * Local Functions Definitions
+ **************************************************************************/
